@@ -58,11 +58,13 @@ trap 'rm -rf "$TEST_TMPDIR" || echo "WARN: cleanup failed (test result unaffecte
 LOCK="$TEST_TMPDIR/acquire.lock"
 : >"$LOCK"
 
-# How long the holder below keeps the lock. The waiter has to start inside this
-# window and outlive it, and each is established by observation rather than by
-# margin, so this only has to be long enough to observe - not long enough to be
-# safe against a slow runner.
-HOLD_SECONDS=6
+# The holder below keeps the lock until this file appears, so how long it holds
+# is the suite's choice rather than a bet on how fast the runner is.
+RELEASE="$TEST_TMPDIR/release"
+
+# How long the measured waiter is left waiting before the holder lets go. Long
+# enough that a spinning wait would burn well over the CPU bound below.
+WAIT_SECONDS=3
 
 PASS=0
 FAIL=0
@@ -73,11 +75,11 @@ fail() {
     echo "FAIL: $*" >&2
 }
 
-# Hold the lock in a background process for $1 seconds. Runs the acquire the
-# same way production does - a shell that opens the descriptor and keeps it
-# open - so the lock under test is the one the kernel actually sees.
-hold_lock_for() {
-    sh -c ". '$LIB'; exec 9>>'$LOCK'; sim_boot_lock_acquire_fd 9 30 || exit 1; sleep $1" &
+# Hold the lock in a background process until RELEASE appears. Runs the
+# acquire the same way production does - a shell that opens the descriptor and
+# keeps it open - so the lock under test is the one the kernel actually sees.
+hold_lock() {
+    sh -c ". '$LIB'; exec 9>>'$LOCK'; sim_boot_lock_acquire_fd 9 30 || exit 1; while [ ! -e '$RELEASE' ]; do sleep 0.1; done" &
 }
 
 # Try to acquire with a $1-second budget and a $2-second poll; echoes the exit
@@ -110,7 +112,7 @@ wait_until_held() {
     done
 }
 
-hold_lock_for "$HOLD_SECONDS"
+hold_lock
 HOLDER_PID=$!
 wait_until_held
 
@@ -135,18 +137,39 @@ fi
 # out on the first line. The CPU bound is loose against the observed spin
 # (seconds of CPU for a seconds-long wait, against milliseconds for a sleeping
 # one), so a loaded runner cannot reach it.
-waiter_report=$(
-    (
-        _wait_rc=0
-        sh -c ". '$LIB'; exec 9>>'$LOCK'; sim_boot_lock_acquire_fd 9 30" >/dev/null 2>&1 ||
-            _wait_rc=$?
-        echo "$_wait_rc"
-        times
-    ) | awk 'NR == 1 { rc = $0 } END { gsub(/[ms]/, " "); print rc, ($1 * 60) + $2 + ($3 * 60) + $4 }'
-)
+WAITER_STARTED="$TEST_TMPDIR/waiter-started"
+WAITER_REPORT="$TEST_TMPDIR/waiter-report"
+(
+    _wait_rc=0
+    sh -c "touch '$WAITER_STARTED'; . '$LIB'; exec 9>>'$LOCK'; sim_boot_lock_acquire_fd 9 30" >/dev/null 2>&1 ||
+        _wait_rc=$?
+    echo "$_wait_rc"
+    times
+) >"$WAITER_REPORT" &
+WAITER_PID=$!
+
+# The waiter is measured only if it actually waited: it has started, and it is
+# still running after WAIT_SECONDS against a lock nobody has released.
+started_deadline=$(($(date +%s) + 60))
+while [ ! -e "$WAITER_STARTED" ]; do
+    if [ "$(date +%s)" -ge "$started_deadline" ]; then
+        echo "ERROR: the waiter never started - suite cannot run" >&2
+        exit 1
+    fi
+    sleep 0.1
+done
+sleep "$WAIT_SECONDS"
+if kill -0 "$WAITER_PID" 2>/dev/null; then
+    pass
+else
+    fail "the waiter returned while the lock was still held - it never waited"
+fi
+touch "$RELEASE"
+wait "$WAITER_PID" || true
+wait "$HOLDER_PID" 2>/dev/null || true
+waiter_report=$(awk 'NR == 1 { rc = $0 } END { gsub(/[ms]/, " "); print rc, ($1 * 60) + $2 + ($3 * 60) + $4 }' "$WAITER_REPORT")
 waiter_rc=${waiter_report%% *}
 waiter_cpu=${waiter_report##* }
-wait "$HOLDER_PID" 2>/dev/null || true
 
 if [ "$waiter_rc" = "0" ]; then
     pass

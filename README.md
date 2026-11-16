@@ -82,6 +82,11 @@ Limits of what the lock covers:
 - **The lock is per user.** Its default path includes the uid, because the
   daemon it protects is also per user. Runners under different accounts take
   different locks and still compete for the machine's disk and CPU.
+- **The lock ends with the wrapper, not with its command.** The kernel releases
+  the lock when the wrapper's descriptor closes, so a wrapper killed before the
+  suite line, by a signal or by SIGKILL, releases it at once. Its xcodebuild,
+  if nothing else stops it, can still be booting when the next waiter's boot
+  starts. Stop the wrapper's process tree, not the wrapper alone.
 - **A simulator boot that does not take the lock is not protected.** If a new
   script calls `simctl boot` directly, the failure it causes shows up in some
   other job on the same Mac. Send every boot through one of the two wrappers.
@@ -173,6 +178,14 @@ a separate warning when it runs out of retries. Between attempts it deletes the
 caller's `-resultBundlePath`, because xcodebuild will not overwrite one. The
 bundle from the last attempt is kept.
 
+Two limits of the classifier. It reads the combined output and does not check
+the exit status, so a run that printed a matching denial is retried whatever it
+exited with. And it learns that a test ran from xcodebuild's per-case lines,
+which a serial run under `-quiet` does not print. In that mode a denial after
+real test work would be retried, and the wrapper warns on every passing run
+that printed no per-case line, so the gap shows up before a failure depends on
+it.
+
 It also flags one failure it does not retry. If xcodebuild exits 134 on a
 `DVTiPhoneSimulator` assertion about a nil `launchSession`, it reports the
 failure as simulator infrastructure.
@@ -210,8 +223,10 @@ lsof "$LOCK"   # the path printed in the error
   `with-sim-boot-lock.sh`. Its descendants show what it is doing. A boot or
   `bootstatus` that is still running after its own bound has passed is stuck.
 
-Stop the stuck holder, not the waiter. Giving waiters a longer budget does not
-fix a stuck holder.
+Stop the stuck work itself, wait for it to exit, and only then its holder.
+Killing only the `lockf` or `flock` process, or only the wrapper's shell,
+releases the lock while the boot it was protecting keeps running. Giving
+waiters a longer budget does not fix a stuck holder.
 
 **`the lock primitive failed (rc=<N>)`**: `lockf` or `flock` itself refused, so
 no other process holds the lock. Look up the status in the primitive's manual

@@ -121,10 +121,22 @@ check_eq "wrapped command's exit status propagates" "42" "$rc"
 # across either primitive branch, unlike hand-rolling a holder - then race a
 # second invocation against a 1s budget it cannot win.
 RAN_MARKER="$TEST_TMPDIR/should-not-run"
-"$SCRIPT" sleep 5 >/dev/null 2>&1 &
+HELD="$TEST_TMPDIR/held"
+RELEASE="$TEST_TMPDIR/release"
+# The holder says when it has the lock and keeps it until told to let go, so
+# the contender below races a lock that is held, however slow the runner is.
+# shellcheck disable=SC2016 # The holder's shell, not this one, expands these.
+"$SCRIPT" sh -c 'touch "$1"; while [ ! -e "$2" ]; do sleep 0.1; done' sh "$HELD" "$RELEASE" \
+    >/dev/null 2>&1 &
 HOLDER_PID=$!
-# Give the holder time to acquire before the contender starts waiting.
-sleep 1
+held_deadline=$(($(date +%s) + 60))
+while [ ! -e "$HELD" ]; do
+    if [ "$(date +%s)" -ge "$held_deadline" ]; then
+        echo "ERROR: the holder never took the lock - suite cannot run" >&2
+        exit 1
+    fi
+    sleep 0.1
+done
 
 set +e
 contend_output=$(SIM_BOOT_ACQUIRE_TIMEOUT=1 "$SCRIPT" touch "$RAN_MARKER" 2>&1)
@@ -139,6 +151,7 @@ else
     pass
 fi
 
+touch "$RELEASE"
 wait "$HOLDER_PID" 2>/dev/null || true
 
 # 4. The lock file outlives a completed run.
