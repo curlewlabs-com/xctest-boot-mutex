@@ -159,9 +159,12 @@ stream_new() {
     STREAM_OFFSET=$_stream_size
 }
 
-# Stop the wrapped command and wait for it, so nothing it started can still be
-# booting when the lock is released. TERM first, which xcodebuild answers by
-# cancelling its run; KILL if it is still there after STOP_GRACE_SECONDS.
+# Stop the wrapped command - the process this shell started, and only that one -
+# and wait for it, so a directly wrapped xcodebuild cannot still be booting when
+# the lock is released. TERM first, which xcodebuild answers by cancelling its
+# run and its own children; KILL if it is still there after STOP_GRACE_SECONDS.
+# A launcher that forks xcodebuild instead of exec'ing it is not covered: its
+# child outlives it, which the README's Limits says.
 STOP_GRACE_SECONDS=30
 # shellcheck disable=SC2329 # called from the EXIT trap's string body
 stop_command() {
@@ -210,8 +213,8 @@ hook_releasing() {
 # reachability tracking requires shellcheck >=0.9.
 #
 # Order matters. The wrapped command is stopped first, so a run ended early -
-# a signal, an internal error - cannot leave a boot running once the lock is
-# gone. Then, if the lock is still held, the hook's `releasing` call runs
+# a signal, an internal error - cannot leave the command it started still
+# booting once the lock is gone. Then, if the lock is still held, the hook's `releasing` call runs
 # BEFORE the release, so it still sees a host no other run can be starting on.
 # The rest of the log is copied before it is deleted. The `exited` call runs
 # last, after the lock is gone and this wrapper's own lines are flushed. rc

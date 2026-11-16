@@ -239,12 +239,14 @@ to run without a lock.
 
 What the scripts do not cover, by design:
 
-- **A wrapper killed with SIGKILL releases the lock with its command still
-  running.** On INT, TERM or HUP the boot mutex stops its command and waits for
-  it before it releases the lock. SIGKILL cannot be caught: the kernel releases
-  the lock when the descriptor closes, and a booting xcodebuild can then overlap
-  the next waiter's boot. Stop the wrapper with TERM, or stop its whole process
-  tree.
+- **The boot mutex stops only the process it started.** On INT, TERM or HUP it
+  sends TERM to that process (KILL after 30 seconds) and waits for it before it
+  releases the lock. Pass `xcodebuild` itself, or a launcher that `exec`s it: a
+  launcher that forks xcodebuild leaves it running when the launcher is stopped.
+  SIGKILL cannot be caught at all, so a wrapper killed that way releases the
+  lock at once with its command still running. In either case a booting
+  xcodebuild can overlap the next waiter's boot, so to cancel a run, stop its
+  whole process tree.
 - **The launch retry needs xcodebuild's per-case lines.** It learns that a test
   ran from them (`Test case '<test>' passed on '<device>'` in parallel-testing
   output, `Test Case '<test>' started.` in serial output). A serial run under
