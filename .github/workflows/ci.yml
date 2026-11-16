@@ -57,7 +57,7 @@ jobs:
         # Both lock primitives: macOS runs take lockf, Linux runs take flock.
         # Only the macOS run covers the lockf descriptor-mode spin that
         # test/sim-boot-lock-acquire.sh exists to catch.
-        os: [ubuntu-24.04, macos-15]
+        os: [ubuntu-24.04, macos-26]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
