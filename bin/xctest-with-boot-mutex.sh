@@ -175,7 +175,11 @@ stop_command() {
         sleep 0.2
     done
     kill -KILL "$XCBUILD_PID" 2>/dev/null || true
-    wait "$XCBUILD_PID" 2>/dev/null || true
+    # Until it is reaped, not just signalled: a trapped signal can return
+    # `wait` early, and an unreaped command can still be running.
+    while kill -0 "$XCBUILD_PID" 2>/dev/null; do
+        wait "$XCBUILD_PID" 2>/dev/null || true
+    done
 }
 release_lock() {
     [ "$LOCK_HELD" = "1" ] || return 0
@@ -212,7 +216,11 @@ hook_releasing() {
 # SC2317 does not flag the body as unreachable; trap-via-function-name
 # reachability tracking requires shellcheck >=0.9.
 #
-# Order matters. The wrapped command is stopped first, so a run ended early -
+# Order matters. A further signal is swallowed from here on: its handler would
+# otherwise `exit` out of this trap, closing FD 9 with the command still
+# running. A no-op handler rather than an ignore, because an ignored signal is
+# inherited by what the trap starts next, the hook. The wrapped command is
+# stopped first, so a run ended early -
 # a signal, an internal error - cannot leave the command it started still
 # booting once the lock is gone. Then, if the lock is still held, the hook's `releasing` call runs
 # BEFORE the release, so it still sees a host no other run can be starting on.
@@ -225,6 +233,7 @@ RUN_COMPLETE=0
 # shellcheck disable=SC2154  # the trap body assigns _trap_rc before it reads it
 trap '
     _trap_rc=$?; [ "$RUN_COMPLETE" = 1 ] || [ "$_trap_rc" -ne 0 ] || _trap_rc=1
+    trap ":" HUP INT TERM
     stop_command
     if [ "$LOCK_HELD" = "1" ]; then
         hook_releasing

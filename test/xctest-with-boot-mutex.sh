@@ -23,6 +23,10 @@
 #   5. A wrapper stopped by a signal before the line stops its command first:
 #      by the time the lock is free, the command is gone. Released while the
 #      command ran on, a cancelled boot would overlap the next waiter's.
+#   5b. A second signal while that stop is still in progress does not cut it
+#      short: a contender stays locked out until the command has exited.
+#      Cut short, the cleanup would close the descriptor with the command
+#      still running - the same overlap, reached by an impatient operator.
 #   6. Everything the command writes reaches stdout, the burst it writes just
 #      before it exits included. Output lost there is the end of a failure's
 #      log, or a per-case line the launch retry needed.
@@ -203,6 +207,42 @@ if wait_for "$TEST_TMPDIR/stage5/command.pid"; then
         "$(sed 's/ pid=[0-9]*//' "$HOOK_LOG" | tr '\n' '|')"
 fi
 check_eq "lock after a TERMed run" free "$(lock_state)"
+
+# 5b. A command that takes seconds to stop on TERM, and a HUP to the wrapper
+# while it does.
+SLOW_STOP="$TEST_TMPDIR/slow-stop"
+cat >"$SLOW_STOP" <<'SLOW'
+#!/bin/sh
+trap 'touch "$1/stopping"; sleep 3; exit 0' TERM
+echo "$$" >"$1/command.pid"
+while :; do sleep 0.1; done
+SLOW
+chmod +x "$SLOW_STOP"
+mkdir "$TEST_TMPDIR/stage5b"
+"$WRAPPER" "$SLOW_STOP" "$TEST_TMPDIR/stage5b" >"$TEST_TMPDIR/run5b.out" 2>&1 &
+SLOW_PID=$!
+if wait_for "$TEST_TMPDIR/stage5b/command.pid"; then
+    SLOW_COMMAND_PID=$(cat "$TEST_TMPDIR/stage5b/command.pid")
+    kill -TERM "$SLOW_PID"
+    if wait_for "$TEST_TMPDIR/stage5b/stopping"; then
+        kill -HUP "$SLOW_PID" 2>/dev/null || true
+        # The command is inside its 3-second stop; the lock must still be held.
+        sleep 1
+        if kill -0 "$SLOW_COMMAND_PID" 2>/dev/null; then
+            check_eq "lock while a stopping command runs, after a second signal" held "$(lock_state)"
+        else
+            fail "the slow-stopping command was gone before the check could run"
+        fi
+    fi
+    wait "$SLOW_PID" 2>/dev/null || true
+    if kill -0 "$SLOW_COMMAND_PID" 2>/dev/null; then
+        fail "the slow-stopping command outlived its wrapper"
+        kill -KILL "$SLOW_COMMAND_PID" 2>/dev/null || true
+    else
+        pass
+    fi
+fi
+check_eq "lock after the slow stop" free "$(lock_state)"
 
 # 6. A burst written just before exit, every line of it on stdout.
 unset XCTEST_BOOT_MUTEX_HOOK
