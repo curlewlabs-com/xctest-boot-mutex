@@ -33,8 +33,8 @@
 # description, which is what the rest of this script's protocol rests on: the
 # kernel releases it when that descriptor closes - normal exit, SIGKILL, OOM,
 # panic - and this script can drop it mid-run by closing that one descriptor.
-# The wrapped command, the log tail and the hook are launched with `9>&-` so
-# none of them inherits FD 9 and extends the lock past the explicit release.
+# The wrapped command and the hook are launched with `9>&-` so neither
+# inherits FD 9 and extends the lock past the explicit release.
 #
 # Why 9: POSIX sh redirection syntax requires a literal single digit for the FD
 # position (`N>file`), so the choice is one of 3..9. 9 is the high end of the
@@ -42,15 +42,10 @@
 # `{varname}>>file` auto-allocation, but macOS ships bash 3.2 and this runs
 # under `/bin/sh` without a Homebrew dependency.
 #
-# Cross-user: the default lock path is per-uid, because the daemon contended on
-# is itself per-user (sim-boot-lock.sh). That separation is about the daemon and
+# Cross-user: the lock path is per-uid, because the daemon contended on is
+# itself per-user (sim-boot-lock.sh). That separation is about the daemon and
 # not about the machine: separate users running simulators still compete for
-# the host's capacity, which no lock here bounds. The mode handling exists for
-# the other case: pointed at one shared path via SIM_BOOT_LOCK_FILE, the file
-# can be foreign-owned, and /tmp's sticky bit means it cannot be unlinked - but
-# `>>` only needs write permission. So `umask 0` before the open makes a fresh
-# file mode 0666, and `chmod 666` after it (best-effort) makes an existing file
-# this user owns world-writable.
+# the host's capacity, which no lock here bounds.
 #
 # Mutex acquisition is HARD-required. Lock-file open failure, timeout, or any
 # other failure to enter the protected window exits non-zero; there is no
@@ -111,7 +106,11 @@ if [ -n "$HOOK" ] && [ ! -x "$HOOK" ]; then
 fi
 
 LOCK_HELD=0
-TAIL_PID=""
+XCBUILD_PID=""
+# 1 while this shell is copying the wrapped command's log to stdout, and the
+# byte offset up to which it has.
+STREAMING=0
+STREAM_OFFSET=0
 ACQUIRE_START_EPOCH=0
 ACQUIRE_END_EPOCH=0
 DEFER_FILE=""
@@ -120,29 +119,26 @@ ts() { date -u +%FT%TZ; }
 
 # Emit one of this wrapper's own diagnostic lines.
 #
-# While `tail -F` is streaming the wrapped command's log (TAIL_PID set), it and
-# this shell are independent processes writing the same stdout. `tail` emits
-# whatever arrived since its last read, so its writes are block-sized rather
-# than line-aligned, and a line written here lands wherever the pipe happens to
-# have room - including partway through one of xcodebuild's. That is not
-# cosmetic: it is how an XCTest failure line gets cut in half and the assertion
-# text is lost, leaving a CI failure whose message cannot be recovered from the
-# job log.
+# While the wrapped command's log is streaming (STREAMING=1), it reaches stdout
+# in whatever chunks it arrived in since the last copy, so its writes are not
+# line-aligned, and a line written between two copies can land partway through
+# one of xcodebuild's. That is not cosmetic: it is how an XCTest failure line
+# gets cut in half and the assertion text is lost, leaving a CI failure whose
+# message cannot be recovered from the job log.
 #
-# So during the tail window there is exactly ONE writer to stdout, and these
-# lines wait in DEFER_FILE until `flush_deferred` runs after the tail is
-# stopped. They keep their own `$(ts)` timestamps and held-durations, so the
-# ordering the deferral costs is still readable off the text.
+# So while it streams, these lines wait in DEFER_FILE until `flush_deferred`
+# runs after the last copy. They keep their own `$(ts)` timestamps and
+# held-durations, so the ordering the deferral costs is still readable off the
+# text.
 wrapper_say() {
-    if [ -n "$TAIL_PID" ] && [ -n "$DEFER_FILE" ]; then
+    if [ "$STREAMING" = 1 ] && [ -n "$DEFER_FILE" ]; then
         echo "$@" >>"$DEFER_FILE"
     else
         echo "$@"
     fi
 }
 
-# Drain DEFER_FILE to stdout. Called only where the tail is already stopped, so
-# this shell is the sole writer again. Safe to call when nothing was deferred
+# Drain DEFER_FILE to stdout. Called only where streaming has stopped. Safe to call when nothing was deferred
 # and safe to call twice - the file is truncated as it is drained, so the EXIT
 # trap cannot re-emit what the normal path already printed.
 flush_deferred() {
@@ -151,13 +147,40 @@ flush_deferred() {
     : >"$DEFER_FILE"
 }
 
+# Copy to stdout whatever the log gained since the last call. The size is read
+# first and the copy bounded to it, so bytes that land mid-copy are left for the
+# next call rather than printed twice. Called on every poll tick, and once more
+# after the command has exited, when the size it reads is final: that last call
+# is what makes the copy complete, where a timed settle could stop short.
+stream_new() {
+    _stream_size=$(wc -c <"$LOG_FILE" 2>/dev/null | tr -d ' ') || return 0
+    [ -n "$_stream_size" ] && [ "$_stream_size" -gt "$STREAM_OFFSET" ] || return 0
+    tail -c +"$((STREAM_OFFSET + 1))" "$LOG_FILE" | head -c "$((_stream_size - STREAM_OFFSET))"
+    STREAM_OFFSET=$_stream_size
+}
+
+# Stop the wrapped command and wait for it, so nothing it started can still be
+# booting when the lock is released. TERM first, which xcodebuild answers by
+# cancelling its run; KILL if it is still there after STOP_GRACE_SECONDS.
+STOP_GRACE_SECONDS=30
+# shellcheck disable=SC2329 # called from the EXIT trap's string body
+stop_command() {
+    [ -n "$XCBUILD_PID" ] && kill -0 "$XCBUILD_PID" 2>/dev/null || return 0
+    kill -TERM "$XCBUILD_PID" 2>/dev/null || true
+    _stop_deadline=$(($(date +%s) + STOP_GRACE_SECONDS))
+    while kill -0 "$XCBUILD_PID" 2>/dev/null && [ "$(date +%s)" -lt "$_stop_deadline" ]; do
+        sleep 0.2
+    done
+    kill -KILL "$XCBUILD_PID" 2>/dev/null || true
+    wait "$XCBUILD_PID" 2>/dev/null || true
+}
 release_lock() {
     [ "$LOCK_HELD" = "1" ] || return 0
     LOCK_HELD=0
     # Close FD 9 - the last reference to the file description from this
-    # process drops, and the kernel releases the lock. The wrapped command,
-    # the tail and the hook were started with `9>&-`, so they have no FD 9 and
-    # cannot extend the lock past this point.
+    # process drops, and the kernel releases the lock. The wrapped command and
+    # the hook were started with `9>&-`, so they have no FD 9 and cannot extend
+    # the lock past this point.
     exec 9>&-
     released_epoch=$(date +%s)
     held=$((released_epoch - ACQUIRE_END_EPOCH))
@@ -166,14 +189,14 @@ release_lock() {
 
 # Run the hook's `releasing` call while the lock is still held. Same
 # single-writer rule as wrapper_say: the hook may print, and this runs mid-run
-# with the tail streaming, so its output joins the deferred lines then.
+# while the log streams, so its output joins the deferred lines then.
 #
 # In a subshell because the EXIT trap reaches this: whatever runs in a subshell
 # can end only the subshell, never the trap.
 hook_releasing() {
     [ -n "$HOOK" ] || return 0
     _hook_rc=0
-    if [ -n "$TAIL_PID" ] && [ -n "$DEFER_FILE" ]; then
+    if [ "$STREAMING" = 1 ] && [ -n "$DEFER_FILE" ]; then
         (XCTEST_BOOT_MUTEX_PID=$$ "$HOOK" releasing 9>&-) >>"$DEFER_FILE" 2>&1 || _hook_rc=$?
     else
         (XCTEST_BOOT_MUTEX_PID=$$ "$HOOK" releasing 9>&-) || _hook_rc=$?
@@ -186,26 +209,27 @@ hook_releasing() {
 # SC2317 does not flag the body as unreachable; trap-via-function-name
 # reachability tracking requires shellcheck >=0.9.
 #
-# Order matters: if the lock is still held at trap time, the hook's
-# `releasing` call runs BEFORE the release, so it still sees a host no other
-# run can be starting on. The `exited` call runs last, after the lock is gone,
-# the tail is stopped and this wrapper's own lines are flushed. rc defaults to
-# 1, so any early-exit path (signal, internal error before xcodebuild) reads
-# as a failure - fail-closed.
+# Order matters. The wrapped command is stopped first, so a run ended early -
+# a signal, an internal error - cannot leave a boot running once the lock is
+# gone. Then, if the lock is still held, the hook's `releasing` call runs
+# BEFORE the release, so it still sees a host no other run can be starting on.
+# The rest of the log is copied before it is deleted. The `exited` call runs
+# last, after the lock is gone and this wrapper's own lines are flushed. rc
+# defaults to 1, so any early-exit path reads as a failure - fail-closed.
 RUN_COMPLETE=0
 # The EXIT trap fails a run that would exit 0 before RUN_COMPLETE=1: macOS
 # /bin/sh can exit 0 after a `set -u` abort.
 # shellcheck disable=SC2154  # the trap body assigns _trap_rc before it reads it
 trap '
     _trap_rc=$?; [ "$RUN_COMPLETE" = 1 ] || [ "$_trap_rc" -ne 0 ] || _trap_rc=1
+    stop_command
     if [ "$LOCK_HELD" = "1" ]; then
         hook_releasing
         release_lock
     fi
-    if [ -n "$TAIL_PID" ]; then
-        kill "$TAIL_PID" 2>/dev/null || true
-        wait "$TAIL_PID" 2>/dev/null || true
-        TAIL_PID=""
+    if [ "$STREAMING" = 1 ]; then
+        stream_new
+        STREAMING=0
     fi
     flush_deferred
     rm -f "$LOG_FILE" 2>/dev/null || true
@@ -219,29 +243,25 @@ trap '
     exit "$_trap_rc"
 ' EXIT
 
-# Cross-user coordination, for the shared-path case the header describes (the
-# default path is per-uid and never foreign-owned). /tmp is sticky-bit, so a
-# foreign-owned lock file cannot be unlinked - but POSIX append (`>>`) only
-# needs write permission on the inode, not ownership. So:
-#   - umask 0 so a freshly created file lands mode 0666 (rw-rw-rw)
-#   - chmod 666 after open (best-effort) in case an existing file this user
-#     owns had a restrictive umask when it was created
-#   - if the open fails entirely (file owned by another user, no world-write),
-#     this is a HARD failure; the run will not proceed unprotected.
-old_umask=$(umask)
-umask 0
-# Probe writability in a subshell so the probe's `2>/dev/null` does not leak
-# into this shell's stderr (an `exec 9>>FILE 2>/dev/null` on the parent shell
-# would permanently silence stderr). The real open follows on probe success.
+# A signal ends the run through the EXIT trap, which stops the wrapped command
+# before it releases the lock. Without these, the shell would die on the signal
+# with the lock released by the kernel and xcodebuild still booting. SIGKILL
+# cannot be caught; the README says what that leaves.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# An open that fails - a file under this name owned by someone else - is a HARD
+# failure; the run will not proceed unprotected. Probe writability in a subshell
+# so the probe's `2>/dev/null` does not leak into this shell's stderr (an
+# `exec 9>>FILE 2>/dev/null` on the parent shell would permanently silence
+# stderr). The real open follows on probe success.
 if ! (exec 9>>"$LOCK_FILE") 2>/dev/null; then
     lock_owner=$(stat -c '%U' "$LOCK_FILE" 2>/dev/null || stat -f '%Su' "$LOCK_FILE" 2>/dev/null || echo unknown)
     echo "::error::xctest boot mutex: cannot open $LOCK_FILE for append (owner=$lock_owner, user=$(id -un)) - operator action required; see \"When acquisition fails\" in the xctest-boot-mutex README" >&2
-    umask "$old_umask"
     exit 1
 fi
 exec 9>>"$LOCK_FILE"
-chmod 666 "$LOCK_FILE" 2>/dev/null || true
-umask "$old_umask"
 
 echo "xctest boot mutex: waiting for lock at $(ts) (lock=$LOCK_FILE timeout=${ACQUIRE_TIMEOUT_SECONDS}s)"
 ACQUIRE_START_EPOCH=$(date +%s)
@@ -286,8 +306,8 @@ if [ -n "$HOOK" ]; then
 fi
 
 # Launch the wrapped command with FD 9 explicitly closed so the kernel lock is
-# not extended past release_lock. stdout/stderr are captured to LOG_FILE and
-# re-streamed via tail -F. NSUnbufferedIO=YES gets each of xcodebuild's stdout
+# not extended past release_lock. stdout/stderr are captured to LOG_FILE, which
+# this shell copies to stdout as it grows. NSUnbufferedIO=YES gets each of xcodebuild's stdout
 # lines into LOG_FILE as it is written. Without it that stdout, going to a
 # regular file, is block-buffered: a line reaches LOG_FILE only when its buffer
 # fills or xcodebuild exits, so the marker arrives late, stderr lines land
@@ -296,40 +316,40 @@ fi
 NSUnbufferedIO=YES "$@" 9>&- >"$LOG_FILE" 2>&1 &
 XCBUILD_PID=$!
 
-# `-n +1` so tail reads from byte 0, not the default last-10-lines: the wrapped
-# command may have already written the first lines of its output before tail
-# starts, and LOG_FILE is unlinked at script exit - without `-n +1`, a fast
-# startup-failure path drops the only visible diagnostic output.
-# Opened BEFORE TAIL_PID is set, because wrapper_say routes to the buffer on
-# TAIL_PID being non-empty: setting the pid first would leave a window whose
-# lines go to a DEFER_FILE that does not exist yet. If the open fails, the
-# variable stays empty and wrapper_say falls back to writing stdout directly -
-# interleaved output is worse than deferred output, but either beats losing the
-# diagnostics outright, and the run itself is unaffected either way.
+# Opened BEFORE STREAMING is set, because wrapper_say routes to the buffer on
+# STREAMING being 1: setting it first would leave a window whose lines go to a
+# DEFER_FILE that does not exist yet. If the open fails, the variable stays
+# empty and wrapper_say falls back to writing stdout directly - interleaved
+# output is worse than deferred output, but either beats losing the diagnostics
+# outright, and the run itself is unaffected either way.
 DEFER_FILE="${RUNNER_TEMP:-/tmp}/xctest-boot-mutex-deferred-$$.log"
 : >"$DEFER_FILE" 2>/dev/null || DEFER_FILE=""
+STREAMING=1
 
-tail -n +1 -F "$LOG_FILE" 9>&- 2>/dev/null &
-TAIL_PID=$!
-
-# Poll for the marker; run the hook's `releasing` call and release the lock the
-# moment it appears. The loop ends if the wrapped command exits before the
-# marker - the EXIT trap then does both, still in that order, as the fail-safe.
+# Copy the log out and poll for the marker until the command exits; run the
+# hook's `releasing` call and release the lock the moment the marker appears.
+# A command that exits before the marker leaves both to the code below, still
+# in that order, with the EXIT trap as the fail-safe.
 while kill -0 "$XCBUILD_PID" 2>/dev/null; do
-    if [ -s "$LOG_FILE" ] && grep -Eq "$MARKER" "$LOG_FILE" 2>/dev/null; then
+    stream_new
+    if [ "$LOCK_HELD" = "1" ] && [ -s "$LOG_FILE" ] && grep -Eq "$MARKER" "$LOG_FILE" 2>/dev/null; then
         wrapper_say "xctest boot mutex: first test suite started at $(ts)"
         hook_releasing
         release_lock
-        break
     fi
     sleep 0.5
 done
 
 # Capture the wrapped command's exit code; `|| rc=$?` keeps set -e from
-# exiting before the tail cleanup runs. After a marker release this waits
-# out the test phase; otherwise the command has already exited.
+# exiting before the log is copied out. The command has already exited.
 rc=0
 wait "$XCBUILD_PID" || rc=$?
+XCBUILD_PID=""
+# Everything the command wrote is in the log now: copy the rest, then this
+# wrapper's own lines from the run, before anything below prints.
+stream_new
+STREAMING=0
+flush_deferred
 
 if [ "$LOCK_HELD" = "1" ]; then
     # The loop ended on process death rather than the marker. One last grep -
@@ -351,13 +371,6 @@ if [ "$LOCK_HELD" = "1" ]; then
         wrapper_say "xctest boot mutex: no test suite started before the wrapped command exited (rc=$rc) - lock held for the whole attempt"
     fi
 fi
-
-# Brief settle so tail flushes the final lines before it is stopped.
-sleep 1
-kill "$TAIL_PID" 2>/dev/null || true
-wait "$TAIL_PID" 2>/dev/null || true
-TAIL_PID=""
-flush_deferred
 
 [ "$rc" -eq 0 ] || exit "$rc"
 RUN_COMPLETE=1

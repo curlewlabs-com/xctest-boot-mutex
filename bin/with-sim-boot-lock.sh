@@ -64,14 +64,11 @@ trap '_trap_rc=$?; [ "$RUN_COMPLETE" = 1 ] || [ "$_trap_rc" -ne 0 ] || _trap_rc=
 # The wrapped command runs from the inner shell via `exec`, so it replaces
 # that shell rather than running as its child - nothing is left holding a
 # descriptor the lock primitive did not intend to hand over, and the wrapped
-# command's exit status is the inner shell's. It also puts back the caller's
-# umask, which the lockf branch below clears only so the lock file is created
-# world-writable: the command's own files keep the caller's mask.
+# command's exit status is the inner shell's.
 # shellcheck disable=SC2016 # Single-quoted deliberately: this is the inner
 # shell's source text, and $1/$@ must be its positional parameters at run
 # time, not this shell's at definition time.
-INNER='umask "$2"; date +%s >"$1"; shift 2; exec "$@"'
-CALLER_UMASK=$(umask)
+INNER='date +%s >"$1"; shift; exec "$@"'
 
 echo "sim boot lock: waiting for lock at $(ts) (lock=$LOCK_FILE timeout=${ACQUIRE_TIMEOUT_SECONDS}s)"
 START_EPOCH=$(date +%s)
@@ -89,20 +86,12 @@ if command -v lockf >/dev/null 2>&1; then
     # else can see, while the next acquirer creates a fresh inode and takes
     # it immediately. That splits the mutex silently, in the one direction
     # nothing downstream would catch.
-    #
-    # umask 0 so lockf creates the file mode 0666, the mode the xctest wrapper
-    # creates it with: every account that may share the lock must be able to
-    # open it for writing, and which holder wins the race to create it must
-    # not decide who can. The inner shell restores the caller's mask before
-    # the command runs.
-    umask 0
     lockf -s -t "$ACQUIRE_TIMEOUT_SECONDS" -k "$LOCK_FILE" \
-        sh -c "$INNER" sh "$STAMP" "$CALLER_UMASK" "$@" || rc=$?
-    umask "$CALLER_UMASK"
+        sh -c "$INNER" sh "$STAMP" "$@" || rc=$?
 elif command -v flock >/dev/null 2>&1; then
     # flock never unlinks its lock file, so it needs no -k counterpart.
     flock -o -x -w "$ACQUIRE_TIMEOUT_SECONDS" "$LOCK_FILE" \
-        sh -c "$INNER" sh "$STAMP" "$CALLER_UMASK" "$@" || rc=$?
+        sh -c "$INNER" sh "$STAMP" "$@" || rc=$?
 else
     echo "::error::sim boot lock: neither lockf nor flock on PATH - refusing to boot a simulator unprotected" >&2
     exit 1

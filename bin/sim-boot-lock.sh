@@ -23,7 +23,7 @@
 # live boots hold different locks, which is the one state this lock exists to
 # prevent.
 sim_boot_lock_file() {
-    printf '%s\n' "${SIM_BOOT_LOCK_FILE:-${TMPDIR:-/tmp}/xctest-sim-boot.$(id -u).lock}"
+    printf '%s\n' "${TMPDIR:-/tmp}/xctest-sim-boot.$(id -u).lock"
 }
 
 # One acquire budget for both wrappers, so an operator reading either log sees
@@ -56,11 +56,8 @@ sim_boot_lock_timeout() {
 #
 # The interval is slack against a hold measured in tens of seconds (a simulator
 # boot), so it is invisible in acquire latency, and one fork per interval is
-# nothing next to what it replaces. Overridable so a test that deliberately
-# loses the race does not pay for it.
-sim_boot_lock_poll_seconds() {
-    printf '%s\n' "${SIM_BOOT_LOCK_POLL_SECONDS:-1}"
-}
+# nothing next to what it replaces.
+_SBL_POLL_SECONDS=1
 
 # Take the lock on an already-open file descriptor: 0 acquired, 1 the budget
 # ran out, 127 no primitive on PATH, anything else the primitive's own failure.
@@ -98,7 +95,6 @@ sim_boot_lock_acquire_fd() {
     else
         return 127
     fi
-    _sbl_sleep=$(sim_boot_lock_poll_seconds)
     while :; do
         # `|| rc=$?` rather than `if attempt; then`, because a failed `if`
         # condition leaves `$?` at the *if statement's* own status - zero when
@@ -116,6 +112,6 @@ sim_boot_lock_acquire_fd() {
             return "$_sbl_rc"
         fi
         [ "$(date +%s)" -lt "$_sbl_deadline" ] || return 1
-        sleep "$_sbl_sleep"
+        sleep "$_SBL_POLL_SECONDS"
     done
 }
