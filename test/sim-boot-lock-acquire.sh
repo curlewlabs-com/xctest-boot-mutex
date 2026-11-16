@@ -82,13 +82,12 @@ hold_lock() {
     sh -c ". '$LIB'; exec 9>>'$LOCK'; sim_boot_lock_acquire_fd 9 30 || exit 1; while [ ! -e '$RELEASE' ]; do sleep 0.1; done" &
 }
 
-# Try to acquire with a $1-second budget and a $2-second poll; echoes the exit
-# status. `|| rc=$?` rather than a bare call, because a losing acquire is an
-# expected non-zero under `set -e`.
+# Try to acquire with a $1-second budget; echoes the exit status. `|| rc=$?`
+# rather than a bare call, because a losing acquire is an expected non-zero
+# under `set -e`.
 try_acquire() {
     _try_rc=0
-    SIM_BOOT_LOCK_POLL_SECONDS="$2" \
-        sh -c ". '$LIB'; exec 9>>'$LOCK'; sim_boot_lock_acquire_fd 9 $1" >/dev/null 2>&1 ||
+    sh -c ". '$LIB'; exec 9>>'$LOCK'; sim_boot_lock_acquire_fd 9 $1" >/dev/null 2>&1 ||
         _try_rc=$?
     echo "$_try_rc"
 }
@@ -103,7 +102,7 @@ try_acquire() {
 # holder out.
 wait_until_held() {
     _wuh_end=$(($(date +%s) + 30))
-    while [ "$(try_acquire 0 1)" -eq 0 ]; do
+    while [ "$(try_acquire 0)" -eq 0 ]; do
         if [ "$(date +%s)" -ge "$_wuh_end" ]; then
             echo "ERROR: the holder never took the lock - suite cannot run" >&2
             exit 1
@@ -117,9 +116,8 @@ HOLDER_PID=$!
 wait_until_held
 
 # 1. A held lock is not acquirable, and a budget the contender cannot win bounds
-# it. The poll override is what keeps a deliberate loss from costing its whole
-# budget in sleep.
-contend_rc=$(try_acquire 1 0.05)
+# it.
+contend_rc=$(try_acquire 1)
 if [ "$contend_rc" -eq 1 ]; then
     pass
 else

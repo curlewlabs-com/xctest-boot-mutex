@@ -57,7 +57,7 @@ jobs:
         # Both lock primitives: macOS runs take lockf, Linux runs take flock.
         # Only the macOS run covers the lockf descriptor-mode spin that
         # test/sim-boot-lock-acquire.sh exists to catch.
-        os: [ubuntu-24.04, macos-15]
+        os: [ubuntu-24.04, macos-26]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
@@ -70,8 +70,17 @@ jobs:
           failed=""
           for suite in test/*.sh; do
             echo "::group::$suite"
+            started=$(date +%s)
             rc=0
-            sh "$suite" || rc=$?
+            # Each suite gets its own bound, well inside the job's: a suite that
+            # hangs then fails here with its output and the process tree below,
+            # where the job timeout would cancel it and keep no log at all.
+            perl -e 'alarm shift; exec @ARGV' 240 sh "$suite" || rc=$?
+            echo "$suite: rc=$rc after $(($(date +%s) - started))s"
+            if [ "$rc" -eq 142 ]; then
+              echo "::error::$suite did not finish within 240s; processes still running:"
+              ps -axo pid,ppid,pgid,stat,etime,command
+            fi
             echo "::endgroup::"
             [ "$rc" -eq 0 ] || failed="$failed $suite"
           done

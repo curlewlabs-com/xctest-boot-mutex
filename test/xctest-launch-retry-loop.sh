@@ -27,10 +27,12 @@ TEST_TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/xctest-launch-retry-loop-test.XXXXXX")
 SUITE_COMPLETE=0
 trap 'rm -rf "$TEST_TMPDIR" || echo "WARN: cleanup failed (test result unaffected): $TEST_TMPDIR" >&2; [ "$SUITE_COMPLETE" = 1 ] || exit 1' EXIT
 
-SIM_BOOT_LOCK_FILE="$TEST_TMPDIR/boot.lock"
+# The lock lives in TMPDIR, so pointing TMPDIR here moves it. The retries and
+# their backoff are the wrapper's own, so the persisting case below waits out
+# the full budget.
+TMPDIR="$TEST_TMPDIR"
 RUNNER_TEMP="$TEST_TMPDIR"
-XCTEST_LAUNCH_RETRY_BACKOFF=0
-export SIM_BOOT_LOCK_FILE RUNNER_TEMP XCTEST_LAUNCH_RETRY_BACKOFF
+export TMPDIR RUNNER_TEMP
 
 PASS=0
 FAIL=0
@@ -103,16 +105,17 @@ run_case() {
     FAKE_COUNT="$TEST_TMPDIR/count-$2"
     export FAKE_PLAN FAKE_COUNT
     _rc=0
-    XCTEST_LAUNCH_RETRIES=$3 "$SCRIPT" "$FAKE" test -resultBundlePath "$TEST_TMPDIR/$2.xcresult" \
+    "$SCRIPT" "$FAKE" test -resultBundlePath "$TEST_TMPDIR/$2.xcresult" \
         >"$TEST_TMPDIR/$2.out" 2>&1 || _rc=$?
     echo "$_rc $(cat "$FAKE_COUNT")"
 }
 
 # 1 + 3. Two denials, then a pass: the cleared bundle lets each retry launch.
-check_eq "denial that clears" "0 3" "$(run_case "deny deny pass" clears 4)"
+check_eq "denial that clears" "0 3" "$(run_case "deny deny pass" clears)"
 
-# 2. Denied every time: three attempts with two retries, then the real status.
-check_eq "denial that persists" "65 3" "$(run_case "deny" persists 2)"
+# 2. Denied every time: the first attempt and its four retries, then the real
+# status.
+check_eq "denial that persists" "65 5" "$(run_case "deny" persists)"
 if [ -d "$TEST_TMPDIR/persists.xcresult" ]; then
     pass
 else
@@ -120,7 +123,7 @@ else
 fi
 
 # 4. A failing test: one attempt, its own status.
-check_eq "real test failure" "65 1" "$(run_case "fail" real 4)"
+check_eq "real test failure" "65 1" "$(run_case "fail" real)"
 
 echo ""
 if [ "$FAIL" -gt 0 ]; then

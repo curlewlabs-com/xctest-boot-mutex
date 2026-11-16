@@ -20,6 +20,16 @@
 #      is the unsafe run.
 #   4. A run that never prints the line still releases at exit, through the
 #      same releasing-call. A lock that outlived its run would wedge the host.
+#   5. A wrapper stopped by a signal before the line stops its command first:
+#      by the time the lock is free, the command is gone. Released while the
+#      command ran on, a cancelled boot would overlap the next waiter's.
+#   5b. A second signal while that stop is still in progress does not cut it
+#      short: a contender stays locked out until the command has exited.
+#      Cut short, the cleanup would close the descriptor with the command
+#      still running - the same overlap, reached by an impatient operator.
+#   6. Everything the command writes reaches stdout, the burst it writes just
+#      before it exits included. Output lost there is the end of a failure's
+#      log, or a per-case line the launch retry needed.
 
 set -eu
 
@@ -29,13 +39,59 @@ PROBE="$REPO_ROOT/bin/with-sim-boot-lock.sh"
 
 TEST_TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/xctest-with-boot-mutex-test.XXXXXX")
 SUITE_COMPLETE=0
-trap 'rm -rf "$TEST_TMPDIR" || echo "WARN: cleanup failed (test result unaffected): $TEST_TMPDIR" >&2; [ "$SUITE_COMPLETE" = 1 ] || exit 1' EXIT
+
+# Every wrapper this suite starts in the background, for cleanup to stop.
+STARTED=""
+
+# Unpark every fixture, then stop every wrapper the suite started and every
+# command those ran. A case that gives up early - a wait that timed out on a slow
+# runner - would otherwise leave a parked fixture and its wrapper running, which
+# can hold the CI job open with nothing more printed.
+# shellcheck disable=SC2329 # called from the EXIT trap's string body
+cleanup_started() {
+    for stage in "$TEST_TMPDIR"/stage*; do
+        [ -d "$stage" ] || continue
+        touch "$stage/boot-done" "$stage/tests-done" "$stage/release" 2>/dev/null || true
+    done
+    # shellcheck disable=SC2046,SC2086 # one PID per word, all written by this suite
+    set -- $STARTED $(cat "$TEST_TMPDIR"/stage*/command.pid 2>/dev/null)
+    for pid in "$@"; do
+        kill -TERM "$pid" 2>/dev/null || true
+    done
+    for pid in "$@"; do
+        kill -0 "$pid" 2>/dev/null || continue
+        sleep 2
+        kill -KILL "$pid" 2>/dev/null || true
+    done
+}
+# End one background case whatever happened in it: unpark its fixture, stop its
+# wrapper if it still runs (bounded past the wrapper's own 30-second stop), and
+# stop the command it ran if that survived. A case that gave up early must not
+# leave its wrapper holding the lock, or the next case's wrapper waits out its
+# whole acquire budget and the suite stalls with nothing printed.
+finish_case() {
+    touch "$2/boot-done" "$2/tests-done" "$2/release" 2>/dev/null || true
+    if kill -0 "$1" 2>/dev/null; then
+        kill -TERM "$1" 2>/dev/null || true
+        _fc_end=$(($(date +%s) + 45))
+        while kill -0 "$1" 2>/dev/null && [ "$(date +%s)" -lt "$_fc_end" ]; do
+            sleep 0.2
+        done
+        kill -KILL "$1" 2>/dev/null || true
+    fi
+    wait "$1" 2>/dev/null || true
+    if [ -s "$2/command.pid" ]; then
+        kill -KILL "$(cat "$2/command.pid")" 2>/dev/null || true
+    fi
+}
+trap 'cleanup_started; rm -rf "$TEST_TMPDIR" || echo "WARN: cleanup failed (test result unaffected): $TEST_TMPDIR" >&2; [ "$SUITE_COMPLETE" = 1 ] || exit 1' EXIT
 
 # A lock of the suite's own, so it never contends with a real simulator boot on
 # a Mac that is also a runner.
-SIM_BOOT_LOCK_FILE="$TEST_TMPDIR/boot.lock"
+# The lock lives in TMPDIR, so pointing TMPDIR here moves it.
+TMPDIR="$TEST_TMPDIR"
 RUNNER_TEMP="$TEST_TMPDIR"
-export SIM_BOOT_LOCK_FILE RUNNER_TEMP
+export TMPDIR RUNNER_TEMP
 
 PASS=0
 FAIL=0
@@ -117,6 +173,7 @@ FAKE
 chmod +x "$FAKE_XCODEBUILD"
 "$WRAPPER" "$FAKE_XCODEBUILD" "$STAGE" >"$TEST_TMPDIR/run1.out" 2>&1 &
 WRAPPER_PID=$!
+STARTED="$STARTED $WRAPPER_PID"
 
 if wait_for "$STAGE/booting"; then
     check_eq "lock before the suite line" held "$(lock_state)"
@@ -136,6 +193,7 @@ fi
 touch "$STAGE/boot-done" "$STAGE/tests-done"
 run_rc=0
 wait "$WRAPPER_PID" || run_rc=$?
+finish_case "$WRAPPER_PID" "$STAGE"
 check_eq "wrapped command's status propagates" 3 "$run_rc"
 check_eq "hook calls, in order, with lock state" \
     "acquired pid=$WRAPPER_PID lock=held|releasing pid=$WRAPPER_PID lock=held|exited 3 pid=$WRAPPER_PID lock=free|" \
@@ -164,6 +222,95 @@ check_eq "silent run's hook calls" \
     "acquired lock=held|releasing lock=held|exited 0 lock=free|" \
     "$(sed 's/ pid=[0-9]*//' "$HOOK_LOG" | tr '\n' '|')"
 check_eq "lock after a silent run" free "$(lock_state)"
+
+# 5. TERM before the suite line: the command is stopped before the release.
+SLEEPER="$TEST_TMPDIR/sleeper"
+cat >"$SLEEPER" <<'SLEEP'
+#!/bin/sh
+echo "$$" >"$1/command.pid"
+while :; do sleep 0.1; done
+SLEEP
+chmod +x "$SLEEPER"
+: >"$HOOK_LOG"
+mkdir "$TEST_TMPDIR/stage5"
+"$WRAPPER" "$SLEEPER" "$TEST_TMPDIR/stage5" >"$TEST_TMPDIR/run5.out" 2>&1 &
+TERM_PID=$!
+STARTED="$STARTED $TERM_PID"
+if wait_for "$TEST_TMPDIR/stage5/command.pid"; then
+    COMMAND_PID=$(cat "$TEST_TMPDIR/stage5/command.pid")
+    kill -TERM "$TERM_PID"
+    term_rc=0
+    wait "$TERM_PID" || term_rc=$?
+    check_eq "a TERMed wrapper exits 143" 143 "$term_rc"
+    if kill -0 "$COMMAND_PID" 2>/dev/null; then
+        fail "the wrapped command outlived its wrapper's TERM"
+        kill -KILL "$COMMAND_PID" 2>/dev/null || true
+    else
+        pass
+    fi
+    # The hook's releasing-call ran with the lock held, after the command was
+    # stopped: a release with the command still running would read the same.
+    check_eq "TERMed run's hook calls" \
+        "acquired lock=held|releasing lock=held|exited 1 lock=free|" \
+        "$(sed 's/ pid=[0-9]*//' "$HOOK_LOG" | tr '\n' '|')"
+fi
+finish_case "$TERM_PID" "$TEST_TMPDIR/stage5"
+check_eq "lock after a TERMed run" free "$(lock_state)"
+
+# 5b. A command that does not finish stopping on TERM until the suite releases
+# it, and a HUP to the wrapper meanwhile. The fixture's lifetime is the suite's
+# to end, so the lock check below cannot race the fixture's own exit.
+SLOW_STOP="$TEST_TMPDIR/slow-stop"
+cat >"$SLOW_STOP" <<'SLOW'
+#!/bin/sh
+trap 'touch "$1/stopping"; while [ ! -e "$1/release" ]; do sleep 0.1; done; exit 0' TERM
+echo "$$" >"$1/command.pid"
+while :; do sleep 0.1; done
+SLOW
+chmod +x "$SLOW_STOP"
+mkdir "$TEST_TMPDIR/stage5b"
+"$WRAPPER" "$SLOW_STOP" "$TEST_TMPDIR/stage5b" >"$TEST_TMPDIR/run5b.out" 2>&1 &
+SLOW_PID=$!
+STARTED="$STARTED $SLOW_PID"
+if wait_for "$TEST_TMPDIR/stage5b/command.pid"; then
+    SLOW_COMMAND_PID=$(cat "$TEST_TMPDIR/stage5b/command.pid")
+    kill -TERM "$SLOW_PID"
+    if wait_for "$TEST_TMPDIR/stage5b/stopping"; then
+        kill -HUP "$SLOW_PID" 2>/dev/null || true
+        # The fixture stays parked until released, so the lock must stay held.
+        # The pause gives a wrapper that mishandled the HUP time to release it.
+        sleep 1
+        check_eq "lock while a stopping command runs, after a second signal" held "$(lock_state)"
+    fi
+    touch "$TEST_TMPDIR/stage5b/release"
+    wait "$SLOW_PID" 2>/dev/null || true
+    if kill -0 "$SLOW_COMMAND_PID" 2>/dev/null; then
+        fail "the slow-stopping command outlived its wrapper"
+        kill -KILL "$SLOW_COMMAND_PID" 2>/dev/null || true
+    else
+        pass
+    fi
+fi
+finish_case "$SLOW_PID" "$TEST_TMPDIR/stage5b"
+check_eq "lock after the slow stop" free "$(lock_state)"
+
+# 6. A burst written just before exit, every line of it on stdout.
+unset XCTEST_BOOT_MUTEX_HOOK
+BURST="$TEST_TMPDIR/burst"
+cat >"$BURST" <<'BURSTEOF'
+#!/bin/sh
+i=0
+while [ "$i" -lt 20000 ]; do
+    echo "burst line $i"
+    i=$((i + 1))
+done
+echo "burst end"
+BURSTEOF
+chmod +x "$BURST"
+"$WRAPPER" "$BURST" >"$TEST_TMPDIR/run6.out" 2>&1 || true
+check_eq "burst lines on stdout" 20001 "$(grep -c '^burst ' "$TEST_TMPDIR/run6.out")"
+check_eq "burst ends with its last line" "burst end" "$(grep '^burst ' "$TEST_TMPDIR/run6.out" | tail -n 1)"
+export XCTEST_BOOT_MUTEX_HOOK="$HOOK"
 
 # A hook that was named and cannot run is refused before the lock is taken.
 missing_rc=0

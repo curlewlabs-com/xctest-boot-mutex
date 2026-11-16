@@ -17,6 +17,8 @@ CoreSimulatorService:
 - `bin/xctest-with-launch-retry.sh` composes in front of the boot mutex and
   retries one failure only: a transient SpringBoard denial of the test host's
   launch, in a run where no test case ran.
+- `bin/xctest-launch-classify.sh` holds the launch retry's classifiers, which
+  the retry and its suite source.
 - `bin/print-xcresult-failures.sh` prints each failed test's assertion message
   from an `.xcresult` bundle, along with what the app logged while that test
   ran. `-quiet` drops both from the console.
@@ -121,24 +123,18 @@ lines are GitHub Actions annotations, which other systems print as plain text.
 
 ### Configuration
 
-| Variable                                             | Default                                 | Meaning                                                                                                                                                                                          |
-| ---------------------------------------------------- | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `SIM_BOOT_LOCK_FILE`                                 | `$TMPDIR/xctest-sim-boot.<uid>.lock`    | The lock file. Leave it at its default unless every holder on the host sets the same path. Two holders that name different files do not exclude each other, and neither reports anything wrong. |
-| `SIM_BOOT_ACQUIRE_TIMEOUT`                           | `600`                                   | Seconds to wait for the lock before failing. `with-sim-boot-lock.sh` exports the resolved value to its command, so a long operation can set itself a shorter bound than its waiters have.        |
-| `SIM_BOOT_LOCK_POLL_SECONDS`                         | `1`                                     | Sleep between attempts for a descriptor-mode waiter (see below).                                                                                                                                 |
-| `XCTEST_BOOT_MUTEX_HOOK`                             | unset                                   | An executable the boot mutex calls at each lock transition (see below).                                                                                                                          |
-| `XCTEST_LAUNCH_RETRIES`                              | `4`                                     | Retries after the first attempt. `0` disables retrying.                                                                                                                                          |
-| `XCTEST_LAUNCH_RETRY_BACKOFF`                        | `15`                                    | Seconds between attempts.                                                                                                                                                                        |
-| `XCTEST_PARALLEL_TESTING_WORKERS`                    | `1`                                     | The parallel-testing width the retry wrapper passes to xcodebuild.                                                                                                                               |
-| `XCTEST_LAUNCH_EVENTS_FILE`                          | unset                                   | The retry wrapper appends one line here for each infrastructure event it classifies.                                                                                                             |
-| `RUNNER_TEMP`                                        | `/tmp`                                  | Where the wrappers keep their per-run logs.                                                                                                                                                      |
+| Variable                          | Default | Meaning                                                                                                                                                                                  |
+| --------------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SIM_BOOT_ACQUIRE_TIMEOUT`        | `600`   | Seconds to wait for the lock before failing. `with-sim-boot-lock.sh` exports the resolved value to its command, so a long operation can set itself a shorter bound than its waiters have. |
+| `XCTEST_BOOT_MUTEX_HOOK`          | unset   | An executable the boot mutex calls at each lock transition (see below).                                                                                                                  |
+| `XCTEST_PARALLEL_TESTING_WORKERS` | `1`     | The parallel-testing width the retry wrapper passes to xcodebuild.                                                                                                                       |
+| `XCTEST_LAUNCH_EVENTS_FILE`       | unset   | The retry wrapper appends one line here for each infrastructure event it classifies.                                                                                                     |
 
-The lock file is created world-writable, mode 0666 (by
-`xctest-with-boot-mutex.sh` everywhere, and by `with-sim-boot-lock.sh` on
-macOS). When `SIM_BOOT_LOCK_FILE` points several accounts on one host at the
-same path, every one of them must be able to open the file for writing to take
-the lock, whichever account happened to create it. The wrappers clear the umask
-only to create that file. The commands they run keep the caller's umask.
+The lock file is `$TMPDIR/xctest-sim-boot.<uid>.lock`, and it is not
+configurable: every holder on a host has to name the same file, and two that
+named different files would not exclude each other, with nothing reporting it.
+`RUNNER_TEMP`, which GitHub Actions sets, is where the wrappers keep their
+per-run logs; outside Actions they use `/tmp`.
 
 ### The hook
 
@@ -171,12 +167,15 @@ denied by service delegate (SBMainWorkspace) for reason: NotFound ("Application 
 In that case xcodebuild exits 65 and no test case runs. This happens even when
 the launch is inside the lock, because the load causing it comes from other
 work on the host, not from other launches. The retry wrapper re-runs the whole
-xcodebuild invocation, with a fresh clone and boot, only when it sees one of
-those reasons together with its detail text and no test case ran. Any other
+xcodebuild invocation, with a fresh clone and boot, only when xcodebuild exited
+65 and the output holds one of those reasons together with its detail text and
+no test case ran. Any other
 failure is propagated immediately, with its original exit status: an assertion,
 a crash, a build error, a signing rejection, a denial for any other reason, or
-a denial after a test has run. The wrapper prints a warning for every retry and
-a separate warning when it runs out of retries. Between attempts it deletes the
+a denial after a test has run, or a denial in a run that exited with any status
+but 65. It retries four times, 15 seconds apart; both are fixed. The wrapper
+prints a warning for every retry and a separate warning when it runs out of
+retries. Between attempts it deletes the
 caller's `-resultBundlePath`, because xcodebuild will not overwrite one. The
 bundle from the last attempt is kept.
 
@@ -189,8 +188,8 @@ failure as simulator infrastructure.
 On macOS, `lockf(1)` spins at about 100% of one core while it waits in
 file-descriptor mode. That is the mode the boot mutex has to use, because it
 releases the lock partway through its command. This was measured; the man page
-does not describe it. So waiters try once per `SIM_BOOT_LOCK_POLL_SECONDS` and
-sleep between attempts. `test/sim-boot-lock-acquire.sh` checks that a waiter
+does not describe it. So waiters try once a second and sleep between
+attempts. `test/sim-boot-lock-acquire.sh` checks that a waiter
 uses less than one second of CPU, and only its macOS run exercises the lockf
 path.
 
@@ -226,38 +225,35 @@ waiters a longer budget does not fix a stuck holder.
 no other process holds the lock. Look up the status in the primitive's manual
 page. `lockf` uses the `sysexits(3)` range.
 
-**`cannot open <path> for append`**: the lock file belongs to another user and
-is not writable. This can only happen when `SIM_BOOT_LOCK_FILE` points several
-users at one path. Fix the permissions in place with `chmod 666 <path>`. Never
-delete the file: a process may hold the lock on the existing inode, and the next
-wrapper would create a new file, lock that, and end up holding a second,
-independent lock.
+**`cannot open <path> for append`**: a file under the lock's name exists and
+this user cannot write it. The name carries this user's uid, so something else
+created it. Check with `lsof <path>` that no process of this user has it open,
+then remove it. Never remove it while one does: that process holds the lock on
+the existing inode, and the next wrapper would create a new file, lock that, and
+end up holding a second, independent lock.
 
 **`neither lockf nor flock on PATH`**: install one of them. The scripts refuse
 to run without a lock.
 
-## Known issues
+## Limits
 
-These are in the code as released and are listed here rather than fixed in it.
-Each affects a narrow case.
+What the scripts do not cover, by design:
 
-- **The lock ends with the wrapper, not with its command.** The kernel releases
-  the lock when the wrapper's descriptor closes, so a wrapper killed before the
-  suite line, by a signal or by SIGKILL, releases it at once. Its xcodebuild,
-  if nothing else stops it, can still be booting when the next waiter's boot
-  starts. Stop the wrapper's process tree, not the wrapper alone.
-- **The launch retry does not check the exit status.** A run whose output holds
-  a matching denial and no per-case line is retried whatever it exited with,
-  including the exit 134 the DVT launch-session abort produces.
-- **The launch retry cannot see tests in serial `-quiet` output.** It learns
-  that a test ran from xcodebuild's per-case lines, which a serial run under
-  `-quiet` does not print, so in that mode a denial after real test work would
-  be retried. The wrapper warns on every passing run that printed no per-case
-  line, so the gap shows up before a failure depends on it.
-- **The boot mutex's last output lines can be lost.** After the command exits,
-  the wrapper gives its log tail one second to catch up before stopping it and
-  deleting the log. Lines the tail has not read by then never reach stdout,
-  which can also drop a per-case line the launch retry would have read.
+- **The boot mutex stops only the process it started.** On INT, TERM or HUP it
+  sends TERM to that process (KILL after 30 seconds) and waits for it before it
+  releases the lock. Pass `xcodebuild` itself, or a launcher that `exec`s it: a
+  launcher that forks xcodebuild leaves it running when the launcher is stopped.
+  SIGKILL cannot be caught at all, so a wrapper killed that way releases the
+  lock at once with its command still running. In either case a booting
+  xcodebuild can overlap the next waiter's boot, so to cancel a run, stop its
+  whole process tree.
+- **The launch retry needs xcodebuild's per-case lines.** It learns that a test
+  ran from them (`Test case '<test>' passed on '<device>'` in parallel-testing
+  output, `Test Case '<test>' started.` in serial output). A serial run under
+  `-quiet` prints neither, so a denial after real test work would look like the
+  transient one. Do not use the retry with serial `-quiet` output. The wrapper
+  warns on every passing run that printed no per-case line, so a caller in that
+  mode finds out before a failure depends on it.
 
 ## Tests
 

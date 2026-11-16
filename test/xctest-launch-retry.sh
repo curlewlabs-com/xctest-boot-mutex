@@ -25,20 +25,20 @@
 #   so it retries a denial after real test work as the zero-tests flake (see
 #   the "parallel-testing case" fixtures below).
 #
-# The classifier is reached by sourcing the wrapper with the source-only guard
-# set, so we exercise the real function, not a copy.
+# The classifiers live in a file the wrapper sources; sourcing it here exercises
+# the real functions, not a copy.
 set -eu
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SCRIPT="$REPO_ROOT/bin/xctest-with-launch-retry.sh"
+LIB="$REPO_ROOT/bin/xctest-launch-classify.sh"
 
-if [ ! -f "$SCRIPT" ]; then
-    echo "ERROR: $SCRIPT not found" >&2
+if [ ! -f "$LIB" ]; then
+    echo "ERROR: $LIB not found" >&2
     exit 1
 fi
 
-# shellcheck source=/dev/null
-XCTEST_LAUNCH_RETRY_SOURCE_ONLY=1 . "$SCRIPT"
+# shellcheck source=SCRIPTDIR/../bin/xctest-launch-classify.sh
+. "$LIB"
 
 PASSED=0
 FAILED=0
@@ -68,13 +68,16 @@ else
 fi
 
 # assert_decision <expected: retry|no-retry> <label> <log-content>
+# A fourth argument is xcodebuild's exit status, 65 (the denial's own) when
+# omitted.
 assert_decision() {
     expected="$1"
     label="$2"
     content="$3"
+    status="${4:-65}"
     f=$(mktemp /tmp/xctest-launch-retry-fixture.XXXXXX)
     printf '%s\n' "$content" >"$f"
-    if is_transient_launch_denial "$f"; then
+    if is_transient_launch_denial "$f" "$status"; then
         actual=retry
     else
         actual=no-retry
@@ -118,6 +121,15 @@ assert_decision retry "transient SBMainWorkspace Busy preflight, zero tests" \
 	The operation couldn't be completed. Application failed preflight checks (FBSOpenApplicationErrorDomain Code=6)
 	denied by service delegate (SBMainWorkspace) for reason: Busy (\"Application failed preflight checks\")
 ** TEST EXECUTE FAILED **"
+
+# The same denial, but xcodebuild exited with something other than the denial's
+# 65. NO RETRY: the abort, crash or signal that produced that status is its own
+# failure and keeps its own attribution (the DVT abort exits 134).
+denial_only="denied by service delegate (SBMainWorkspace) for reason: Busy (\"Application failed preflight checks\")
+** TEST EXECUTE FAILED **"
+assert_decision no-retry "Busy denial, exit 134 (abort)" "$denial_only" 134
+assert_decision no-retry "Busy denial, exit 1" "$denial_only" 1
+assert_decision retry "Busy denial, exit 65" "$denial_only" 65
 
 # REGRESSION GUARD (Busy): the real CI log always contains "Testing started"
 # (xcodebuild orchestration) AND the boot-mutex wrapper's own report that no
