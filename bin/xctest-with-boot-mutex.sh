@@ -174,12 +174,17 @@ stop_command() {
     while kill -0 "$XCBUILD_PID" 2>/dev/null && [ "$(date +%s)" -lt "$_stop_deadline" ]; do
         sleep 0.2
     done
-    kill -KILL "$XCBUILD_PID" 2>/dev/null || true
-    # Until it is reaped, not just signalled: a trapped signal can return
-    # `wait` early, and an unreaped command can still be running.
-    while kill -0 "$XCBUILD_PID" 2>/dev/null; do
-        wait "$XCBUILD_PID" 2>/dev/null || true
-    done
+    # Escalate only a command still there at the deadline. One that has gone is
+    # already reaped - this shell reaps its children as they exit - and its PID
+    # may belong to an unrelated process by now. The check and the KILL run back
+    # to back, which leaves only a reuse inside that gap uncovered.
+    if kill -0 "$XCBUILD_PID" 2>/dev/null; then
+        kill -KILL "$XCBUILD_PID" 2>/dev/null || true
+    fi
+    # Collect its status. A trapped signal can return this early; by then the
+    # command has exited or been sent SIGKILL, which it cannot outrun, so
+    # nothing it started is still being driven when the lock is released.
+    wait "$XCBUILD_PID" 2>/dev/null || true
 }
 release_lock() {
     [ "$LOCK_HELD" = "1" ] || return 0
@@ -216,7 +221,8 @@ hook_releasing() {
 # SC2317 does not flag the body as unreachable; trap-via-function-name
 # reachability tracking requires shellcheck >=0.9.
 #
-# Order matters. A further signal is swallowed from here on: its handler would
+# Order matters. A further signal is swallowed from here on (on_signal has
+# already done the same when a signal began the exit): its handler would
 # otherwise `exit` out of this trap, closing FD 9 with the command still
 # running. A no-op handler rather than an ignore, because an ignored signal is
 # inherited by what the trap starts next, the hook. The wrapped command is
@@ -259,9 +265,25 @@ trap '
 # before it releases the lock. Without these, the shell would die on the signal
 # with the lock released by the kernel and xcodebuild still booting. SIGKILL
 # cannot be caught; the README says what that leaves.
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
+#
+# The handler swallows further signals before anything else, so a second one
+# cannot exit out of the cleanup the first began. While the command is being
+# launched (LAUNCHING=1) it does not exit at all: the exit waits until the
+# command's PID is recorded, or the cleanup would not know what to stop.
+LAUNCHING=0
+PENDING_SIGNAL_EXIT=""
+# shellcheck disable=SC2329 # called from the signal traps' string bodies
+on_signal() {
+    trap ":" HUP INT TERM
+    if [ "$LAUNCHING" = 1 ]; then
+        PENDING_SIGNAL_EXIT=$1
+        return 0
+    fi
+    exit "$1"
+}
+trap 'on_signal 129' HUP
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
 
 # An open that fails - a file under this name owned by someone else - is a HARD
 # failure; the run will not proceed unprotected. Probe writability in a subshell
@@ -325,8 +347,11 @@ fi
 # fills or xcodebuild exits, so the marker arrives late, stderr lines land
 # inside half-written stdout lines, and whatever is still buffered when
 # xcodebuild dies never reaches the job log.
+LAUNCHING=1
 NSUnbufferedIO=YES "$@" 9>&- >"$LOG_FILE" 2>&1 &
 XCBUILD_PID=$!
+LAUNCHING=0
+[ -z "$PENDING_SIGNAL_EXIT" ] || exit "$PENDING_SIGNAL_EXIT"
 
 # Opened BEFORE STREAMING is set, because wrapper_say routes to the buffer on
 # STREAMING being 1: setting it first would leave a window whose lines go to a

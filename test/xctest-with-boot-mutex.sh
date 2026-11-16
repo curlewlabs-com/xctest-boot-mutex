@@ -208,12 +208,13 @@ if wait_for "$TEST_TMPDIR/stage5/command.pid"; then
 fi
 check_eq "lock after a TERMed run" free "$(lock_state)"
 
-# 5b. A command that takes seconds to stop on TERM, and a HUP to the wrapper
-# while it does.
+# 5b. A command that does not finish stopping on TERM until the suite releases
+# it, and a HUP to the wrapper meanwhile. The fixture's lifetime is the suite's
+# to end, so the lock check below cannot race the fixture's own exit.
 SLOW_STOP="$TEST_TMPDIR/slow-stop"
 cat >"$SLOW_STOP" <<'SLOW'
 #!/bin/sh
-trap 'touch "$1/stopping"; sleep 3; exit 0' TERM
+trap 'touch "$1/stopping"; while [ ! -e "$1/release" ]; do sleep 0.1; done; exit 0' TERM
 echo "$$" >"$1/command.pid"
 while :; do sleep 0.1; done
 SLOW
@@ -226,14 +227,12 @@ if wait_for "$TEST_TMPDIR/stage5b/command.pid"; then
     kill -TERM "$SLOW_PID"
     if wait_for "$TEST_TMPDIR/stage5b/stopping"; then
         kill -HUP "$SLOW_PID" 2>/dev/null || true
-        # The command is inside its 3-second stop; the lock must still be held.
+        # The fixture stays parked until released, so the lock must stay held.
+        # The pause gives a wrapper that mishandled the HUP time to release it.
         sleep 1
-        if kill -0 "$SLOW_COMMAND_PID" 2>/dev/null; then
-            check_eq "lock while a stopping command runs, after a second signal" held "$(lock_state)"
-        else
-            fail "the slow-stopping command was gone before the check could run"
-        fi
+        check_eq "lock while a stopping command runs, after a second signal" held "$(lock_state)"
     fi
+    touch "$TEST_TMPDIR/stage5b/release"
     wait "$SLOW_PID" 2>/dev/null || true
     if kill -0 "$SLOW_COMMAND_PID" 2>/dev/null; then
         fail "the slow-stopping command outlived its wrapper"
