@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}-${{ github.ref_name == 'main' && github.run_id || 'pr' }}
+  cancel-in-progress: ${{ github.ref_name != 'main' }}
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install shellcheck
+        # The runner image's shellcheck moves with the image; this one moves
+        # only when the pin does.
+        run: |
+          # renovate: datasource=github-releases depName=koalaman/shellcheck
+          version=v0.11.0
+          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/${version}/shellcheck-${version}.linux.x86_64.tar.xz" |
+            tar -xJ -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/shellcheck-${version}" >>"$GITHUB_PATH"
+      - name: Shellcheck
+        run: shellcheck -x bin/*.sh test/*.sh
+
+  actionlint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run actionlint
+        # The installer script is pinned to a commit so it cannot change under
+        # this job, and it is told which release to download.
+        run: |
+          # renovate: datasource=github-releases depName=rhysd/actionlint extractVersion=^v(?<version>.+)$
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/914e7df21a07ef503a81201c76d2b11c789d3fca/scripts/download-actionlint.bash) 1.7.12
+          ./actionlint -color
+
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both lock primitives: macOS runs take lockf, Linux runs take flock.
+        # Only the macOS run covers the lockf descriptor-mode spin that
+        # test/sim-boot-lock-acquire.sh exists to catch.
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Suites
+        run: |
+          set -eu
+          failed=""
+          for suite in test/*.sh; do
+            echo "::group::$suite"
+            rc=0
+            sh "$suite" || rc=$?
+            echo "::endgroup::"
+            [ "$rc" -eq 0 ] || failed="$failed $suite"
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::failed:$failed"
+            exit 1
+          fi
+
+  conclusion:
+    needs: [shellcheck, actionlint, test]
+    runs-on: ubuntu-24.04
+    if: always()
+    steps:
+      - name: Require every job to pass
+        env:
+          SHELLCHECK: ${{ needs.shellcheck.result }}
+          ACTIONLINT: ${{ needs.actionlint.result }}
+          TEST: ${{ needs.test.result }}
+        run: test "$SHELLCHECK" = success && test "$ACTIONLINT" = success && test "$TEST" = success
