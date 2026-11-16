@@ -30,6 +30,10 @@
 #      one each "hold" the lock, which splits the mutex silently.
 #   5. The wrapped command receives the resolved acquire budget, so a longer
 #      operation can remain bounded below its peer waiters.
+#   6. The wrapped command runs under the caller's umask, while the lock file
+#      it shares with other accounts is still created world-writable. The
+#      wrapper clears the umask to create that file; leaking the cleared mask
+#      into the command would make everything it writes world-writable.
 
 set -eu
 
@@ -168,7 +172,19 @@ BUDGET_FILE="$TEST_TMPDIR/acquire-budget"
 SIM_BOOT_ACQUIRE_TIMEOUT=37 "$SCRIPT" sh -c 'printf "%s\n" "$SIM_BOOT_ACQUIRE_TIMEOUT" >"$1"' sh "$BUDGET_FILE" >/dev/null 2>&1
 check_eq "wrapped command receives resolved acquire budget" "37" "$(cat "$BUDGET_FILE")"
 
-# 6. Usage error is distinct from each outcome above, so a caller that forgot its command
+# 6. The caller's umask reaches the command; the lock file keeps its shared
+# mode. A fresh lock path, so this run is the one that creates it.
+MASK_FILE="$TEST_TMPDIR/command-umask"
+FRESH_LOCK="$TEST_TMPDIR/fresh.lock"
+# shellcheck disable=SC2016 # The child shell, not this test, runs umask.
+(umask 077 && SIM_BOOT_LOCK_FILE="$FRESH_LOCK" "$SCRIPT" sh -c 'umask >"$1"' sh "$MASK_FILE") >/dev/null 2>&1
+check_eq "wrapped command keeps the caller's umask" "0077" "$(cat "$MASK_FILE")"
+if command -v lockf >/dev/null 2>&1; then
+    lock_mode=$(stat -c '%A' "$FRESH_LOCK" 2>/dev/null || stat -f '%Sp' "$FRESH_LOCK")
+    check_eq "lockf creates the shared lock file world-writable" "-rw-rw-rw-" "$lock_mode"
+fi
+
+# 7. Usage error is distinct from each outcome above, so a caller that forgot its command
 # does not read as a lock problem.
 set +e
 "$SCRIPT" >/dev/null 2>&1

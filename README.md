@@ -133,6 +133,13 @@ lines are GitHub Actions annotations, which other systems print as plain text.
 | `XCTEST_LAUNCH_EVENTS_FILE`                          | unset                                   | The retry wrapper appends one line here for each infrastructure event it classifies.                                                                                                             |
 | `RUNNER_TEMP`                                        | `/tmp`                                  | Where the wrappers keep their per-run logs.                                                                                                                                                      |
 
+The lock file is created world-writable, mode 0666 (by
+`xctest-with-boot-mutex.sh` everywhere, and by `with-sim-boot-lock.sh` on
+macOS). When `SIM_BOOT_LOCK_FILE` points several accounts on one host at the
+same path, every one of them must be able to open the file for writing to take
+the lock, whichever account happened to create it. The wrappers clear the umask
+only to create that file. The commands they run keep the caller's umask.
+
 ### The hook
 
 Some bookkeeping is only sound while no other run can be booting a simulator,
