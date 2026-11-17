@@ -31,3 +31,57 @@ for suite in test/*.sh; do sh "$suite" || echo "FAILED: $suite"; done
 ```
 
 CI runs the suites on Linux and macOS; only the macOS run exercises `lockf`.
+
+## Releasing
+
+A release is a fixed `vMAJOR.MINOR.PATCH` tag on a `main` commit and the
+GitHub Release published on it, carrying `xctest-boot-mutex-<version>.tar.gz`
+and `SHA256SUMS`. A fix is a patch release. A new, changed or removed option
+or behavior is a minor release until 1.0. The README's "Releases" says what no
+release may change.
+
+1. Merge the release's pull request with a merge commit, and wait for the `CI`
+   and `CodeQL` runs on the merge commit on `main` to pass.
+2. Tag that commit and push the tag. The fixed-version-tag ruleset blocks
+   moving or deleting a pushed tag, so check the commit first.
+
+   ```sh
+   git fetch origin
+   git tag -a v0.2.1 -m v0.2.1 <commit>
+   git push origin v0.2.1
+   ```
+
+3. The tag starts `release.yml`. It fails unless the tagged commit is on
+   `main`, runs CI on it again, builds the archive from the tag with
+   `git archive`, and drafts the release with the archive and `SHA256SUMS`.
+4. Check the draft against a local build: the archive matches `SHA256SUMS`,
+   and it holds exactly what the tag holds. Compare contents, not the archive's
+   digest, since gzip output can differ between git versions.
+
+   ```sh
+   v=0.2.1
+   dir=$(mktemp -d)
+   gh release download "v$v" -D "$dir/draft"
+   (cd "$dir/draft" && shasum -a 256 -c SHA256SUMS)
+   mkdir "$dir/released" "$dir/local"
+   tar -xzf "$dir/draft/xctest-boot-mutex-$v.tar.gz" -C "$dir/released"
+   git archive --prefix="xctest-boot-mutex-$v/" "v$v" | tar -x -C "$dir/local"
+   diff -r "$dir/released" "$dir/local"
+   ```
+
+5. Replace the draft's placeholder notes with notes in the shape of the
+   previous releases: what was fixed, closed with a reason, added or removed,
+   each entry naming its issue, ending with the `SHA256SUMS` and 0.x lines.
+
+   ```sh
+   gh release edit "v$v" --notes-file notes.md
+   ```
+
+6. Publish the draft:
+
+   ```sh
+   gh release edit "v$v" --draft=false
+   ```
+
+   Release immutability is on, so publishing locks the tag and both assets for
+   good. A mistake found after this ships in the next patch release.
