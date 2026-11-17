@@ -41,10 +41,10 @@ and `SHA256SUMS`. A fix is a patch release. A new, changed or removed option
 or behavior is a minor release until 1.0. The README's "Releases" says what no
 release may change.
 
-A patch or minor release needs no approval beyond the checks in the steps below:
-whoever cuts it follows them in order, and each step's check is the gate. A
-major version, a 1.0, or a minor before 1.0 that changes an interface consumers
-use needs the maintainer's explicit approval before its tag is pushed.
+A patch or minor release needs no approval: whoever cuts it follows the steps
+below in order, on a `main` commit whose required checks have passed. A major
+version, a 1.0, or a minor before 1.0 that changes an interface consumers use
+needs the maintainer's explicit approval before its tag is pushed.
 
 1. Merge the release's pull request with a merge commit, and wait for the `CI`
    and `CodeQL` runs on the merge commit on `main` to pass.
