@@ -1,5 +1,11 @@
 # Contributing
 
+Thanks for your interest in improving `xctest-boot-mutex`. The bar for a change
+is whether it keeps simulator boots on a host one at a time while test
+execution still runs in parallel. Bug fixes, a transient failure the launch
+retry can tell apart from a real one with certainty, sharper messages when the
+lock cannot be taken, and clearer docs are all welcome.
+
 Keep changes on a branch and open a pull request that states the behavior
 change and how you verified it.
 
@@ -10,6 +16,15 @@ Curlew Labs maintains this project. Jeffrey Wall
 and approves the releases that [need approval](#releasing). Use issues for
 reproducible defects and proposals; use
 [private vulnerability reporting](SECURITY.md) for security concerns.
+
+## Before a large change
+
+Open an issue describing the problem first. Where the lock is taken and
+released carries the guarantee: it is taken before xcodebuild starts, released
+at the first suite-started line, and never skipped, since a boot without it
+brings back the failure it prevents. The README's "Why it exists" and "When
+acquisition fails" record why each point is where it is. A short discussion up
+front saves rework.
 
 ## Rules
 
