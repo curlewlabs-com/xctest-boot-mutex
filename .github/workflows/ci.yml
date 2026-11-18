@@ -15,40 +15,6 @@ concurrency:
   cancel-in-progress: ${{ github.ref_name != 'main' }}
 
 jobs:
-  shellcheck:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Install shellcheck
-        # The runner image's shellcheck moves with the image; this one moves
-        # only when the pin does.
-        run: |
-          # renovate: datasource=github-releases depName=koalaman/shellcheck
-          version=v0.11.0
-          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/${version}/shellcheck-${version}.linux.x86_64.tar.xz" |
-            tar -xJ -C "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/shellcheck-${version}" >>"$GITHUB_PATH"
-      - name: Shellcheck
-        run: shellcheck -x bin/*.sh test/*.sh
-
-  actionlint:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Run actionlint
-        # The installer script is pinned to a commit so it cannot change under
-        # this job, and it is told which release to download.
-        run: |
-          # renovate: datasource=github-releases depName=rhysd/actionlint extractVersion=^v(?<version>.+)$
-          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/914e7df21a07ef503a81201c76d2b11c789d3fca/scripts/download-actionlint.bash) 1.7.12
-          ./actionlint -color
-
   test:
     name: Test (${{ matrix.os }})
     strategy:
@@ -98,17 +64,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: curlewlabs-com/ci-baseline@c82082df9a3c5e6dab047d9ddb92f130f1537d8e # v0.1.1
+      - uses: curlewlabs-com/ci-baseline@f05f17a38ba2dfbaf0cde130a375b346e9a923a2 # v0.2.0
 
   conclusion:
-    needs: [shellcheck, actionlint, test, baseline]
+    needs: [test, baseline]
     runs-on: ubuntu-24.04
     if: always()
     steps:
       - name: Require every job to pass
         env:
-          SHELLCHECK: ${{ needs.shellcheck.result }}
-          ACTIONLINT: ${{ needs.actionlint.result }}
           TEST: ${{ needs.test.result }}
           BASELINE: ${{ needs.baseline.result }}
-        run: test "$SHELLCHECK" = success && test "$ACTIONLINT" = success && test "$TEST" = success && test "$BASELINE" = success
+        run: test "$TEST" = success && test "$BASELINE" = success

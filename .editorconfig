@@ -1,0 +1,5 @@
+# The scripts already use four-space indentation; shfmt reads this instead of
+# its tab default.
+[*.sh]
+indent_style = space
+indent_size = 4

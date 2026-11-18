@@ -123,12 +123,12 @@ lines are GitHub Actions annotations, which other systems print as plain text.
 
 ### Configuration
 
-| Variable                          | Default | Meaning                                                                                                                                                                                  |
-| --------------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Variable                          | Default | Meaning                                                                                                                                                                                   |
+| --------------------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `SIM_BOOT_ACQUIRE_TIMEOUT`        | `600`   | Seconds to wait for the lock before failing. `with-sim-boot-lock.sh` exports the resolved value to its command, so a long operation can set itself a shorter bound than its waiters have. |
-| `XCTEST_BOOT_MUTEX_HOOK`          | unset   | An executable the boot mutex calls at each lock transition (see below).                                                                                                                  |
-| `XCTEST_PARALLEL_TESTING_WORKERS` | `1`     | The parallel-testing width the retry wrapper passes to xcodebuild.                                                                                                                       |
-| `XCTEST_LAUNCH_EVENTS_FILE`       | unset   | The retry wrapper appends one line here for each infrastructure event it classifies.                                                                                                     |
+| `XCTEST_BOOT_MUTEX_HOOK`          | unset   | An executable the boot mutex calls at each lock transition (see below).                                                                                                                   |
+| `XCTEST_PARALLEL_TESTING_WORKERS` | `1`     | The parallel-testing width the retry wrapper passes to xcodebuild.                                                                                                                        |
+| `XCTEST_LAUNCH_EVENTS_FILE`       | unset   | The retry wrapper appends one line here for each infrastructure event it classifies.                                                                                                      |
 
 The lock file is `$TMPDIR/xctest-sim-boot.<uid>.lock`, and it is not
 configurable: every holder on a host has to name the same file, and two that
@@ -143,11 +143,11 @@ such as recording which XCTestDevice clones this run created so that they can
 be deleted afterwards. `XCTEST_BOOT_MUTEX_HOOK` names an executable that the
 boot mutex calls at three points:
 
-| Call             | When                                                                     | A non-zero exit                               |
-| ---------------- | ------------------------------------------------------------------------ | --------------------------------------------- |
-| `HOOK acquired`  | The lock is held, and the wrapped command has not started.               | Aborts the run with exit 1. The command never starts. |
-| `HOOK releasing` | The lock is still held and is about to be released, either at the suite line or at exit. | Logs a warning.                               |
-| `HOOK exited RC` | The lock is released, and the command has exited with `RC` (`1` if it never started). | Logs a warning.                               |
+| Call             | When                                                                                     | A non-zero exit                                       |
+| ---------------- | ---------------------------------------------------------------------------------------- | ----------------------------------------------------- |
+| `HOOK acquired`  | The lock is held, and the wrapped command has not started.                               | Aborts the run with exit 1. The command never starts. |
+| `HOOK releasing` | The lock is still held and is about to be released, either at the suite line or at exit. | Logs a warning.                                       |
+| `HOOK exited RC` | The lock is released, and the command has exited with `RC` (`1` if it never started).    | Logs a warning.                                       |
 
 Every call receives `XCTEST_BOOT_MUTEX_PID`, the wrapper's process ID. The value
 is the same for all three calls in a run, and the process lives exactly as long
