@@ -106,3 +106,10 @@ needs the maintainer's explicit approval before its tag is pushed.
 
    Release immutability is on, so publishing locks the tag and both assets for
    good. A mistake found after this ships in the next patch release.
+
+## License
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this project by you, as defined in the Apache-2.0 license,
+shall be dual licensed under the MIT and Apache-2.0 licenses, as the README's
+License section describes, without any additional terms or conditions.
